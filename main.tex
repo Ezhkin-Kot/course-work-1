@@ -228,7 +228,7 @@
 
 Наиболее простым в технической реализации является обычное целочисленное позиционирование. Использование целочисленного порядкового индекса, по которому происходит сортировка, порождает серьезные архитектурные узкие места в реляционных СУБД. При перемещении блока в начало списка бэкенд вынужден выполнять ресурсозатратный запрос для сдвига всех последующих элементов. Такой запрос будет выглядеть следующим образом:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 UPDATE blocks SET position = position + 1
   WHERE position >= target_position
 \end{minted}
@@ -277,7 +277,7 @@ UPDATE blocks SET position = position + 1
 
 Для классификации состояний жизненного цикла снапшотов был создан перечисляемый тип данных \texttt{snapshot\_status}:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 CREATE TYPE snapshot_status AS ENUM ('draft', 'published', 'stale');
 \end{minted}
 
@@ -291,7 +291,7 @@ CREATE TYPE snapshot_status AS ENUM ('draft', 'published', 'stale');
 
 Базовые сущности подсистемы описываются следующими структурами данных:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 CREATE TABLE course_snapshots (
     id uuid PRIMARY KEY DEFAULT uuidv7(),
     course_id uuid NOT NULL REFERENCES courses(id),
@@ -309,7 +309,7 @@ ON course_snapshots(course_id, version) WHERE (status = 'published');
 
 Таблица \texttt{blocks}, содержащая модули контента курса (текст, задания, тесты), тоже претерпела изменения:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 CREATE TABLE blocks (
     id uuid PRIMARY KEY DEFAULT uuidv7(),
     snapshot_id uuid NOT NULL REFERENCES course_snapshots(id),
@@ -324,7 +324,7 @@ CREATE TABLE blocks (
 
 Для фиксации монопольного права на редактирование спроектирована таблица блокировок:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 CREATE TABLE course_locks (
     course_id uuid PRIMARY KEY REFERENCES courses(id),
     user_id uuid NOT NULL REFERENCES users(id),
@@ -343,7 +343,7 @@ CREATE TABLE course_locks (
 
 Процесс активируется при выполнении фронтендом POST"=запроса на эндпоинт \texttt{/api/v1/courses/\{course\_id\}/lock}. Для исключения состояния гонки в момент параллельного обращения двух преподавателей к одной сущности, бэкенд открывает транзакцию в PostgreSQL и выполняет операцию пессимистического ожидания на уровне СУБД:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 SELECT 1 FROM courses WHERE id = :course_id FOR UPDATE;
 \end{minted}
 
@@ -353,7 +353,7 @@ SELECT 1 FROM courses WHERE id = :course_id FOR UPDATE;
 
 Первый сценарий "---  это создание новой сессии. Если запись о блокировке курса отсутствует или значение \texttt{expires\_at} строго меньше текущего времени сервера, это свидетельствует о том, что курс свободен или предыдущая сессия завершилась по таймауту. Бэкенд выполняет атомарную вставку или обновление записи:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 INSERT INTO course_locks (course_id, user_id, session_id, expires_at)
 VALUES ($1, $2, $3, NOW() + MAKE_INTERVAL(secs => $4))
 ON CONFLICT (course_id) DO UPDATE
@@ -377,7 +377,7 @@ RETURNING course_id, user_id, session_id, expires_at
 
 Бэкенд обрабатывает данный запрос в рамках одной транзакции. Сначала проверяется наличие и актуальность имеющейся блокировки пользователя и вместе с тем блокируется на время транзакции соответствующая запись в таблице через \texttt{FOR UPDATE}. После успешной проверки действительности блокировки происходит обновление её времени жизни на заданный в конфигурации приложения интервал (по умолчанию 60 секунд):
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 UPDATE course_locks 
 SET expires_at = NOW() + MAKE_INTERVAL(secs => $1) 
 WHERE course_id = $2
@@ -389,7 +389,7 @@ WHERE course_id = $2
 
 После успешной проверки блокировки пользователя производится попытка обновления версии курса и установки нового активного снапшота. В этом запросе автоматически происходит оптимистическая проверка версии курса:
 
-\begin{minted}{sql}
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{sql}
 UPDATE courses
 SET active_snapshot_id = $1, version = version + 1
 WHERE id = $2 AND version = $3 AND deleted_at IS NULL
@@ -471,7 +471,7 @@ WHERE id = $2 AND version = $3 AND deleted_at IS NULL
   \item проведено комплексное интеграционное тестирование созданных компонентов с использованием библиотеки Testcontainers.
 \end{itemize}
 
-Таким образом, все задачи, поставленные в рамках курсовой работы, были успешно решены, а её цель "--- достигнута. Разработанный программный модуль готов к интеграции в код бэкенда образовательной платформы <<MergeMinds>> и обладает потенциалом для дальнейшего расширения функциональности.
+Таким образом, все задачи, поставленные в рамках курсовой работы, были успешно решены, а её цель "--- достигнута. Разработанный программный модуль готов к интеграции в код бэкенда образовательной платформы и обладает потенциалом для дальнейшего расширения функциональности.
 
 % Отобразить все источники. Даже те, на которые нет ссылок.
 % \nocite{*}
