@@ -341,17 +341,15 @@ CREATE TABLE course_locks (
 
 \subsubsection{Алгоритм захвата блокировки и инициализации черновика}
 
-Процесс активируется при выполнении фронтендом POST"=запроса на эндпоинт \texttt{/api/v1/courses/\{course\_id\}/lock}. Для исключения состояния гонки в момент параллельного обращения двух преподавателей к одной сущности, бэкенд открывает транзакцию в PostgreSQL и выполняет операцию пессимистического ожидания на уровне СУБД:
+Процесс активируется при выполнении фронтендом POST"=запроса на эндпоинт \texttt{/api/v1/courses/\{course\_id\}/lock}. На первом этапе бэкенд осуществляет валидацию прав доступа пользователя: проверяется наличие роли \texttt{TEACHER} в таблице \texttt{course\_members}. Если проверка прошла успешно, управление передается компоненту управления блокировками.
+
+Для исключения состояния гонки в момент параллельного обращения двух преподавателей к одной сущности, бэкенд открывает транзакцию и выполняет операцию пессимистического ожидания на уровне СУБД:
 
 \begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{postgresql}
 SELECT 1 FROM courses WHERE id = :course_id FOR UPDATE;
 \end{minted}
 
-Данная конструкция блокирует строку курса для любых параллельных транзакций, пытающихся выполнить аналогичный захват \cite{postgres_concurrency}. Далее бэкенд осуществляет последовательную проверку прав доступа пользователя (наличие роли \texttt{TEACHER} в таблице \texttt{course\_members}) и текущего состояния таблицы блокировок \texttt{course\_locks}.
-
-В зависимости от результатов анализа существующих записей в таблице \texttt{course\_locks}, бизнес"=логика сервера разветвляется на три сценария.
-
-Первый сценарий "---  это создание новой сессии. Если запись о блокировке курса отсутствует или значение \texttt{expires\_at} строго меньше текущего времени сервера, это свидетельствует о том, что курс свободен или предыдущая сессия завершилась по таймауту. Бэкенд выполняет атомарную вставку или обновление записи:
+Данная конструкция блокирует строку курса для любых параллельных транзакций, пытающихся выполнить аналогичный захват \cite{postgres_concurrency}. Далее бэкенд выполняет атомарную вставку или обновление записи в таблице блокировок:
 
 \begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{postgresql}
 INSERT INTO course_locks (course_id, user_id, session_id, expires_at)
@@ -363,13 +361,17 @@ SET user_id = EXCLUDED.user_id,
 RETURNING course_id, user_id, session_id, expires_at
 \end{minted}
 
-В рамках этой же транзакции инициализируется новый снимок"=черновик: в таблицу \texttt{course\_snapshots} добавляется запись со статусом \texttt{draft} и версией, на 1 больше текущей версии курса, а все блоки из текущего опубликованного снапшота копируются в новый черновик. Фронтенду возвращается HTTP"=код \texttt{200 OK} и параметр \texttt{init\_type = new}.
+Если блокировка уже удерживается другим пользователем и её время жизни не истекло, сервер немедленно прерывает обработку запроса и возвращает HTTP"=код \texttt{423 Locked}. В будущем планируется добавить в структуру этого ответа ФИО пользователя, который в данный момент удерживает блокировку.
 
-Вторым сценарием является восстановление существующей сессии. Если в СУБД обнаружена активная блокировка, принадлежащая тому же пользователю и той же сессии браузера, и при этом в системе существует черновик, чья версия актуальна (то есть ровно на единицу больше текущей версии курса), бэкенд пролонгирует время жизни блокировки и возвращает идентификатор существующего черновика вместе со статусом \texttt{init\_type = restored}. Это позволяет пользователю безболезненно продолжить работу при случайной перезагрузке страницы.
+В случае успешного захвата блокировки бэкенд производит попытку поиска существующего черновика данного пользователя. В зависимости от результатов анализа, бизнес"=логика сервера разветвляется на три сценария.
 
-Третьим сценарием является обработка конфликта версий. Критический сценарий возникает, когда у пользователя имеется незавершенный черновик, однако за время отсутствия у этого пользователя активной блокировки другой преподаватель успел перехватить блокировку, внести изменения и успешно опубликовать новую версию курса. В этой ситуации версия черновика текущего пользователя становится неактуальной. Чтобы предотвратить автоматическое затирание чужих изменений, бэкенд не блокирует интерфейс полностью, а возвращает статус \texttt{init\_type = stale\_conflict}. Фронтенд, перехватив данный маркер, выводит предупреждение и предоставляет преподавателю возможность для ручного копирования нужного контента из устаревшего черновика в новый.
+Первый сценарий "--- это восстановление существующей сессии. Если в системе обнаружен незавершённый черновик текущего пользователя, чья версия актуальна (то есть ровно на единицу больше текущей версии курса), бэкенд возвращает идентификатор этого черновика вместе со статусом \texttt{init\_type = restored}. Это позволяет пользователю безболезненно продолжить работу при случайной перезагрузке страницы или сетевом сбое.
 
-Если же блокировка удерживается принципиально другим пользователем, сервер немедленно прерывает транзакцию и возвращает HTTP"=код \texttt{423 Locked}. В будущем планируется добавить в структуру этого ответа ФИО пользователя, который в данный момент удерживает блокировку.
+Вторым сценарием является обработка конфликта версий. Критический сценарий возникает, когда у пользователя имеется незавершенный черновик, однако за время отсутствия у этого пользователя активной блокировки другой преподаватель успел перехватить блокировку, внести изменения и успешно опубликовать новую версию курса. В этой ситуации версия черновика текущего пользователя становится неактуальной. Чтобы предотвратить автоматическое затирание чужих изменений, бэкенд не блокирует интерфейс полностью, а возвращает статус \texttt{init\_type = stale\_conflict}. Фронтенд, перехватив данный маркер, выводит предупреждение и предоставляет преподавателю возможность для ручного копирования нужного контента из устаревшего черновика в новый.
+
+Третий сценарий "--- это создание новой сессии. Если записи с существующим черновиком пользователя не нашлось, бэкенд открывает транзакцию и инициализирует новый снапшот"=черновик: в таблицу \texttt{course\_snapshots} добавляется запись со статусом \texttt{draft} и версией, на 1 больше текущей версии курса, а все блоки из текущего опубликованного снапшота копируются в новый черновик. Фронтенду возвращается HTTP"=код \texttt{200 OK} и параметр \texttt{init\_type = new}.
+
+Все эти сценарии проверяются в методе сервиса курсов \texttt{LockAndInitDraft}, код которого приведён в приложении А.
 
 \subsubsection{Протокол поддержания активности (heartbeat)}
 
@@ -383,9 +385,11 @@ SET expires_at = NOW() + MAKE_INTERVAL(secs => $1)
 WHERE course_id = $2
 \end{minted}
 
+Код метода репозитория блокировок \texttt{RefreshLock}, в котором происходит транзакция продления блокировки, приведён в приложении Б.
+
 \subsection{Процедура сохранения и публикации изменений}
 
-Когда преподаватель завершает редактирование и нажимает в интерфейсе кнопку сохранения изменений, фронтенд инициирует POST"=запрос на эндпоинт \texttt{/api/v1/courses/\{course\_id\}/publish}. На бэкенде открывается транзакция, выполняющая финальную верификацию и публикацию данных.
+Когда преподаватель завершает редактирование и нажимает в интерфейсе кнопку сохранения изменений, фронтенд инициирует POST"=запрос на эндпоинт \texttt{/api/v1/courses/\{course\_id\}/publish}. На бэкенде выполняется финальная верификация и публикация данных.
 
 После успешной проверки блокировки пользователя производится попытка обновления версии курса и установки нового активного снапшота. В этом запросе автоматически происходит оптимистическая проверка версии курса:
 
@@ -395,11 +399,13 @@ SET active_snapshot_id = $1, version = version + 1
 WHERE id = $2 AND version = $3 AND deleted_at IS NULL
 \end{minted}
 
-Если в СУБД изменилось ноль строк, это свидетельствует о нарушении оптимистической изоляции (версия курса была изменена другим процессом). В этом случае транзакция откатывается с ошибкой \texttt{409 Conflict}.
+Если в СУБД изменилось ноль строк, это свидетельствует о нарушении оптимистической изоляции (версия курса была изменена другим процессом). В этом случае обработка запроса прерывается с ошибкой \texttt{409 Conflict}.
 
 При успешном обновлении строки курса, статус снапшота в таблице \texttt{course\_snapshots} меняется на \texttt{published}.
 
 Запись о блокировке из таблицы \texttt{course\_locks} удаляется, тем самым полностью освобождая курс для последующих сессий редактирования. С этого момента студенты мгновенно начинают видеть изменения, так как поле \texttt{active\_snapshot\_id} курса указывает на новый опубликованный снимок.
+
+Код метода сервиса курсов \texttt{PublishDraft}, в котором происходит основная логика обработки запроса публикации, приведён в приложении В.
 
 Если же пользователь решает отменить редактирование, то при выполнении запроса \texttt{/api/v1/courses/\{course\_id\}/cancel\_edit)} бэкенд удаляет имеющуюся блокировку, переводит статус снапшота в \texttt{stale}, а у всех связанных с ним блоков заполняет поле \texttt{deleted\_at} значением текущего времени, помечая таким образом эти сущности, как удалённые.
 
@@ -422,7 +428,7 @@ WHERE id = $2 AND version = $3 AND deleted_at IS NULL
 
 Для обеспечения перестановки и вставки контентных блоков учебного курса за константное время, в бэкенд проекта был интегрирован алгоритм строкового дробного индексирования.
 
-Главным вычислительным ядром подсистемы строкового индексирования является функция \texttt{calculateMiddlePosition}, которая принимает индексы предыдущего и последующего элементов (\texttt{prev} и \texttt{next}) и вычисляет уникальную строку, находящуюся строго в лексикографическом интервале между позициями этих элементов. Для генерации строковых индексов эта функция может использовать заглавные и строчные буквы латинского алфавита, а также цифры от 0 до 9. В сумме доступный ей алфавит составляет 62 символа. Внутри данного алгоритма выделяются четыре логических сценария вычисления индексов.
+Главным вычислительным ядром подсистемы строкового индексирования является функция \texttt{calculateMiddlePosition}, которая принимает индексы предыдущего и последующего элементов (\texttt{prev} и \texttt{next}) и вычисляет уникальную строку, находящуюся строго в лексикографическом интервале между позициями этих элементов. Для генерации строковых индексов эта функция может использовать заглавные и строчные буквы латинского алфавита, а также цифры от 0 до 9. В сумме доступный ей алфавит составляет 62 символа. Внутри данного алгоритма выделяются четыре логических сценария вычисления индексов. Код функции \texttt{calculateMiddlePosition} приведён в приложении Г.
 
 При создании самого первого блока, когда таблица блоков пуста и оба входных параметра являются пустыми строками, функция возвращает медианный символ своего алфавита, формируя центральную точку отсчета. Это закладывает симметричный базис для последующих перестановок как в начало, так и в конец формируемого списка.
 
@@ -438,7 +444,7 @@ WHERE id = $2 AND version = $3 AND deleted_at IS NULL
 
 Процесс переиндексации вынесен в асинхронный метод, выполняющийся в отдельном изолированном процессе (goroutine) \cite{donovan_go}. Такой подход гарантирует, что тяжелая вычислительная задача не заблокирует основной поток обработки HTTP"=запроса пользователя и не вызовет задержек в интерфейсе.
 
-Асинхронная балансировка считывает полный список блоков текущего снапшота, упорядоченный СУБД по лексикографическому индексу. Далее для каждого блока вычисляется его относительный математический вес в диапазоне от $0.0$ до $1.0$. Функция \texttt{weightToPosition} осуществляет последовательное масштабирование полученного веса на основание системы счисления (длину алфавита из 62 символов), выдавая блокам новые, более оптимальные индексы. Это позволяет равномерно распределить элементы по доступному алфавитному диапазону и исправить избыточную глубину вросших индексов.
+Асинхронная балансировка считывает полный список блоков текущего снапшота, упорядоченный СУБД по лексикографическому индексу. Далее для каждого блока вычисляется его относительный математический вес в диапазоне от $0.0$ до $1.0$. Функция \texttt{weightToPosition} осуществляет последовательное масштабирование полученного веса на основание системы счисления (длину алфавита из 62 символов), выдавая блокам новые, более оптимальные индексы. Это позволяет равномерно распределить элементы по доступному алфавитному диапазону и исправить избыточную глубину вросших индексов. Код метода \texttt{rebalanceSnapshotPositions}, служащего для переиндексации блоков, вместе с его вспомогательной функцией \texttt{weightToPosition} приведён в приложении Д.
 
 \subsection{Интеграционное тестирование разработанных механизмов}
 
@@ -458,7 +464,7 @@ WHERE id = $2 AND version = $3 AND deleted_at IS NULL
 
 \conclusion
 
-В ходе выполнения курсовой работы был спроектирован и успешно реализован механизм редактирования учебных курсов для бэкенда образовательной платформы <<MergeMinds>>. Разработанное решение в достаточной мере отвечает требованиям строгой изоляции данных, масштабируемости и качества пользовательского опыта в условиях многопользовательского распределённого доступа. Полный исходный код бэкенда представлен в приложении А. 
+В ходе выполнения курсовой работы был спроектирован и успешно реализован механизм редактирования учебных курсов для бэкенда образовательной платформы <<MergeMinds>>. Разработанное решение в достаточной мере отвечает требованиям строгой изоляции данных, масштабируемости и качества пользовательского опыта в условиях многопользовательского распределённого доступа. Полный исходный код бэкенда представлен в приложении Е. 
 
 На основе проведённого исследования и реализации прикладного программного слоя можно сформулировать основные результаты работы:
 
@@ -483,9 +489,358 @@ WHERE id = $2 AND version = $3 AND deleted_at IS NULL
 % документа будет являться приложением
 \appendix
 
+\section{Программный код метода \texttt{LockAndInitDraft}}
+
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{go}
+func (s *Service) LockAndInitDraft(
+	ctx context.Context,
+	session *locks.LockSession,
+) (*InitLockResult, error) {
+	// Check user permissions
+	courseMember, err := s.CheckCourseMember(
+		ctx,
+		session.UserID,
+		session.CourseID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if courseMember.Role != TeacherRole {
+		return nil, ErrPermissionDenied
+	}
+
+	// Try to set pessimistic lock for the course
+	_, err = s.locksService.SetLock(ctx, session)
+	if err != nil {
+		return nil, err
+	}
+
+	draft, err := s.snapshotsService.FindUserDraft(
+		ctx,
+		session.CourseID,
+		session.UserID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("lock and init: find draft: %w", err)
+	}
+
+	course, err := s.repo.GetCourseByID(ctx, session.CourseID)
+	if err != nil {
+		return nil, fmt.Errorf("lock and init: get course: %w", err)
+	}
+	if course == nil {
+		return nil, ErrCourseNotFound
+	}
+
+	// If user's draft already exists, check that it is still actual
+	if draft != nil {
+		if draft.Version == course.Version+1 {
+			// Case 1: Draft exists and is actual
+			return &InitLockResult{
+				InitType:        InitTypeRestored,
+				DraftSnapshotID: draft.ID,
+			}, nil
+		}
+		// Case 2: Draft exists but it version is stale
+		return &InitLockResult{
+			InitType:        InitTypeStaleConflict,
+			DraftSnapshotID: draft.ID,
+		}, nil
+	}
+
+	// Case 3: Draft does not exist, create a new one
+	var newDraft *snapshots.Snapshot
+	err = s.txManager.ExecInTx(ctx, func(tx *sqlx.Tx) error {
+		var txErr error
+		targetVersion := course.Version + 1
+		newDraft, txErr = s.snapshotsService.CreateDraftFromActual(
+			ctx,
+			tx,
+			session.CourseID,
+			targetVersion,
+			session.UserID,
+			*course.ActiveSnapshotID,
+		)
+		return txErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("lock and init: create draft tx: %w", err)
+	}
+
+	return &InitLockResult{
+		InitType:        InitTypeNew,
+		DraftSnapshotID: newDraft.ID,
+	}, nil
+}
+\end{minted}
+
+\section{Программный код метода \texttt{RefreshLock}}
+
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{go}
+func (r *PGRepo) RefreshLock(
+	ctx context.Context,
+	model *locks.LockSession,
+	ttlSeconds int,
+) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("refresh lock transaction failed: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var currentLock locks.Lock
+
+	// Get the current lock for update
+	err = tx.GetContext(
+		ctx,
+		&currentLock,
+		getCourseLockForUpdateSQL,
+		model.CourseID,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return locks.ErrLockNotFound
+		}
+		return fmt.Errorf("refresh lock check: %w", err)
+	}
+
+	// Check if the lock is held by someone else
+	if currentLock.UserID != model.UserID ||
+		currentLock.SessionID != model.SessionID {
+		return locks.ErrLockHeldByAnother
+	}
+
+	// Check if the lock has expired
+	if time.Now().After(currentLock.ExpiresAt) {
+		return locks.ErrLockExpired
+	}
+
+	// If the lock is still valid, refresh it's lifetime
+	_, err = tx.ExecContext(
+		ctx,
+		refreshCourseLockSQL,
+		ttlSeconds,
+		model.CourseID,
+	)
+	if err != nil {
+		return fmt.Errorf("refresh lock update: %w", err)
+	}
+
+	return tx.Commit()
+}
+\end{minted}
+
+\section{Программный код метода \texttt{PublishDraft}}
+
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{go}
+func (s *Service) PublishDraft(
+	ctx context.Context,
+	session *locks.LockSession,
+	draftSnapshotID uuid.UUID,
+) error {
+	// Check active lock
+	err := s.locksService.ValidateLock(ctx, session)
+	if err != nil {
+		return err
+	}
+
+	draft, err := s.snapshotsService.GetSnapshotByID(ctx, draftSnapshotID)
+	if err != nil {
+		return fmt.Errorf("publish draft: get draft: %w", err)
+	}
+	if draft == nil || draft.Status != snapshots.DraftStatus ||
+		draft.CourseID != session.CourseID || draft.CreatedBy != session.UserID {
+		return ErrDraftNotFound
+	}
+
+	publishSnapshot := &PublishSnapshot{
+		CourseID:        session.CourseID,
+		NewSnapshotID:   draftSnapshotID,
+		ExpectedVersion: draft.Version - 1,
+	}
+
+	err = s.txManager.ExecInTx(ctx, func(tx *sqlx.Tx) error {
+		txErr := s.repo.PublishSnapshotToCourse(
+			ctx,
+			tx,
+			publishSnapshot,
+		)
+		if txErr != nil {
+			if errors.Is(txErr, sql.ErrNoRows) {
+				return ErrSnapshotConflict
+			}
+			return txErr
+		}
+
+		return s.snapshotsService.UpdateSnapshotStatus(
+			ctx,
+			tx,
+			draftSnapshotID,
+			snapshots.PublishedStatus,
+		)
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := s.locksService.Unlock(ctx, session); err != nil {
+		zap.L().Error("failed to remove course lock", zap.Error(err))
+	}
+
+	return nil
+}
+\end{minted}
+
+\section{Программный код функции \texttt{calculateMiddlePosition}}
+
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{go}
+func calculateMiddlePosition(prev, next string) string {
+	// Case 1: both values are empty (blocks table is empty)
+	if prev == "" && next == "" {
+		return string(midChar)
+	}
+
+	// Case 2: insertion at the top
+	if prev == "" {
+		runes := []rune(next)
+		for i := len(runes) - 1; i >= 0; i-- {
+			idx := strings.IndexRune(alphabet, runes[i])
+			if idx > 0 {
+				// If we decrease the character and it becomes equal to minChar (0),
+				// we add midChar to give a buffer for future moves (0V).
+				if idx-1 == 0 {
+					return string(
+						runes[:i],
+					) + string(
+						alphabet[0],
+					) + string(
+						midChar,
+					)
+				}
+				runes[i] = rune(alphabet[idx-1])
+				return string(runes[:i+1])
+			}
+		}
+		return string(minChar) + string(midChar)
+	}
+
+	// Case 3: insertion at the bottom
+	if next == "" {
+		runes := []rune(prev)
+		for i := len(runes) - 1; i >= 0; i-- {
+			idx := strings.IndexRune(alphabet, runes[i])
+			if idx < len(alphabet)-1 {
+				runes[i] = rune(alphabet[idx+1])
+				return string(runes[:i+1])
+			}
+		}
+		return prev + string(midChar)
+	}
+
+	// Case 4: insertion in the middle
+	var result strings.Builder
+	for i := 0; ; i++ {
+		pIdx := 0
+		if i < len(prev) {
+			pIdx = strings.IndexByte(alphabet, prev[i])
+		}
+
+		nIdx := len(alphabet) - 1
+		if i < len(next) {
+			nIdx = strings.IndexByte(alphabet, next[i])
+		}
+
+		// If the last chars of positions are the same, increment the length
+		if pIdx == nIdx {
+			result.WriteByte(alphabet[pIdx])
+			continue
+		}
+
+		// If there is a free space between positions, calculate the middle
+		if nIdx-pIdx > 1 {
+			midIdx := pIdx + (nIdx-pIdx)/2
+			result.WriteByte(alphabet[midIdx])
+			break
+		}
+
+		// If the difference is 1, increment the length
+		result.WriteByte(alphabet[pIdx])
+
+		next = ""
+	}
+
+	return result.String()
+}
+\end{minted}
+
+\section{Программный код метода \texttt{rebalanceSnapshotPositions}}
+
+\begin{minted}[linenos, breaklines=true, style=bw, fontsize=\small]{go}
+func (s *Service) rebalanceSnapshotPositions(
+	ctx context.Context,
+	snapshotID uuid.UUID,
+) {
+	zap.L().
+		Info("Starting lazy position rebalancing for snapshot", zap.String("snapshot_id", snapshotID.String()))
+
+	blocksList, err := s.repo.GetAllBlocksBySnapshotID(ctx, snapshotID)
+	if err != nil {
+		zap.L().
+			Error("rebalance positions: failed to fetch blocks", zap.Error(err))
+		return
+	}
+
+	// Redistribute positions:
+	// first block gets the middle position of the range,
+	// every next block gets the position between previous and the end of the range ("~" character)
+	totalBlocks := len(blocksList)
+	if totalBlocks == 0 {
+		return
+	}
+
+	for i, block := range blocksList {
+		// Calculate weight from 0.0 to 1.0
+		// Add 1 to the value of totalBlocks to leave a gap at the end of the alphabet
+		weight := float64(i+1) / float64(totalBlocks+1)
+
+		// Convert weight to position in alphabet
+		newPos := weightToPosition(weight, alphabet)
+
+		if block.Position != newPos {
+			err = s.repo.UpdateBlockPosition(ctx, block.ID, newPos)
+			if err != nil {
+				zap.L().
+					Error("rebalance positions: failed to update block position", zap.Error(err))
+			}
+		}
+	}
+	zap.L().
+		Info("Position rebalancing successfully finished", zap.String("snapshot_id", snapshotID.String()))
+}
+
+// weightToPosition converts weight from 0.0 to 1.0 to position in 62-char alphabet
+func weightToPosition(weight float64, alphabet string) string {
+	var result []byte
+	base := float64(len(alphabet))
+
+	for range 4 {
+		weight *= base
+		idx := int(weight)
+
+		result = append(result, alphabet[idx])
+
+		weight -= float64(idx)
+		if weight < 1e-9 { // If the remainder is negligible, round and exit
+			break
+		}
+	}
+	return string(result)
+}
+\end{minted}
+
 \section{Исходный код бэкенда платформы <<MergeMinds>>}
 
-Исходный код приложен на съёмном носителе и расположен в директории \texttt{mm-backend}:
+Исходный код всего проекта приложен на флеш-накопителе и расположен в директории \texttt{mm-backend}:
 
 \begin{itemize}
   \item в директории \texttt{mm-backend/db} хранятся миграционные скрипты для создания схемы базы данных;
